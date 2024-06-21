@@ -3,38 +3,35 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers import StoppingCriteria, StoppingCriteriaList, TextIteratorStreamer
 from threading import Thread
 import streamlit as st
+import sqlite3
+from sqlite3 import Error
+import re
 
-# Loading the tokenizer and model from Hugging Face's model hub.
 tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 model = AutoModelForCausalLM.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
-# using CUDA for an optimal experience
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model = model.to(device)
 
-
-# Defining a custom stopping criteria class for the model's text generation.
 class StopOnTokens(StoppingCriteria):
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
-        stop_ids = [2]  # IDs of tokens where the generation should stop.
+        stop_ids = [2]  
         for stop_id in stop_ids:
-            if input_ids[0][-1] == stop_id:  # Checking if the last generated token is a stop token.
+            if input_ids[0][-1] == stop_id:  
                 return True
         return False
 
-
-# Function to generate model predictions.
 def predict(message, history):
     history_transformer_format = history + [[message, ""]]
     stop = StopOnTokens()
 
     # Formatting the input for the model.
-    messages = "</s>".join(["</s>".join(["\n<|user|>:" + item[0], "\n<|assistant|>:" + item[1]])
-                        for item in history_transformer_format])
+    messages = "</s>".join(["</s>".join(["\n:" + item[0], "\n:" + item[1]]) for item in history_transformer_format])
     model_inputs = tokenizer([messages], return_tensors="pt").to(device)
-    streamer = TextIteratorStreamer(tokenizer, timeout=10., skip_prompt=True, skip_special_tokens=True)
+    streamer = TextIteratorStreamer(tokenizer, timeout=10.0, skip_prompt=True, skip_special_tokens=True)
     generate_kwargs = dict(
-        model_inputs,
+        input_ids=model_inputs['input_ids'],
+        attention_mask=model_inputs['attention_mask'],
         streamer=streamer,
         max_new_tokens=1024,
         do_sample=True,
@@ -45,7 +42,7 @@ def predict(message, history):
         stopping_criteria=StoppingCriteriaList([stop])
     )
     t = Thread(target=model.generate, kwargs=generate_kwargs)
-    t.start()  # Starting the generation in a separate thread.
+    t.start()  
     partial_message = ""
     for new_token in streamer:
         partial_message += new_token
@@ -53,12 +50,9 @@ def predict(message, history):
             break
         yield partial_message
 
-import sqlite3
-from sqlite3 import Error
-
 # Function to create a SQLite connection.
 def create_connection():
-    conn = None;
+    conn = None
     try:
         conn = sqlite3.connect(':memory:')  # Creates an in-memory SQLite database.
         print(sqlite3.version)
@@ -66,7 +60,6 @@ def create_connection():
         print(e)
     return conn
 
-# Function to create a table in the SQLite database.
 def create_table(conn):
     try:
         sql = '''CREATE TABLE activities(
@@ -85,7 +78,6 @@ def create_table(conn):
     except Error as e:
         print(e)
 
-# Function to insert activities into the SQLite database.
 def insert_activities(conn, activities):
     sql = '''INSERT INTO activities(day, steps_walked, hours_slept, water_intake, exercise_duration, mood, calories_intake, productivity_score, work_done)
              VALUES(?,?,?,?,?,?,?,?,?)'''
@@ -101,32 +93,49 @@ def select_activities(conn, day):
     rows = cur.fetchall()
     return rows
 
-# Function to track daily activities.
-def track_activities(conn, day):
-    steps_walked = st.number_input('Enter steps walked today', min_value=0)
-    hours_slept = st.number_input('Enter hours of sleep', min_value=0)
-    water_intake = st.number_input('Enter water intake in liters', min_value=0.0)
-    exercise_duration = st.number_input('Enter exercise duration in minutes', min_value=0)
-    mood = st.selectbox('How was your mood today?', ['Excellent', 'Good', 'Neutral', 'Bad', 'Very Bad'])
-    calories_intake = st.number_input('Enter calories intake', min_value=0)
-    productivity_score = st.slider('Rate your productivity today', min_value=0, max_value=10)
-    work_done = st.text_input('Enter work done today')
-    activities = (day, steps_walked, hours_slept, water_intake, exercise_duration, mood, calories_intake, productivity_score, work_done)
-    insert_activities(conn, activities)
+def parse_activity_input(message):
+    activity_data = {}
+    patterns = {
+        'steps_walked': r"(\d+) steps",
+        'hours_slept': r"(\d+(\.\d+)?) hours of sleep",
+        'water_intake': r"(\d+(\.\d+)?) liters of water",
+        'exercise_duration': r"(\d+) minutes of exercise",
+        'mood': r"(Excellent|Good|Neutral|Bad|Very Bad) mood",
+        'calories_intake': r"(\d+) calories",
+        'productivity_score': r"productivity score of (\d+)",
+        'work_done': r"work done: (.+)"
+    }
 
-# Streamlit interface
+    for key, pattern in patterns.items():
+        match = re.search(pattern, message)
+        if match:
+            activity_data[key] = match.group(1) if key != 'mood' else match.group(0)
+
+    return activity_data
+
 def main():
-    st.title("Tinyllama_chatBot")
-    st.write("Ask Tiny llama any questions")
+    st.title("TinyLlama ChatBot")
+    st.write("Ask TinyLlama any questions or input your daily activities.")
     message = st.text_input('Enter your message')
-    history = []  # You can update this as per your requirement
+    history = []
     if st.button('Send'):
         response = predict(message, history)
-        st.write(response)
+        response_text = "".join([r for r in response])
+        st.write(response_text)
+        activity_data = parse_activity_input(response_text)
+        if activity_data:
+            day = st.number_input('Enter the day', min_value=1)
+            conn = create_connection()
+            create_table(conn)
+            activities = (day, activity_data.get('steps_walked', 0), activity_data.get('hours_slept', 0), 
+                          activity_data.get('water_intake', 0), activity_data.get('exercise_duration', 0), 
+                          activity_data.get('mood', ''), activity_data.get('calories_intake', 0), 
+                          activity_data.get('productivity_score', 0), activity_data.get('work_done', ''))
+            insert_activities(conn, activities)
+            st.write("Activity data logged successfully.")
     conn = create_connection()
     create_table(conn)
-    day = st.number_input('Enter the day', min_value=1)
-    track_activities(conn, day)
+    day = st.number_input('Enter the day to retrieve activities', min_value=1)
     if st.button('Show activities'):
         activities = select_activities(conn, day)
         for activity in activities:
