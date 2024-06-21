@@ -1,54 +1,26 @@
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers import StoppingCriteria, StoppingCriteriaList, TextIteratorStreamer
-from threading import Thread
+from openai import OpenAI
 import streamlit as st
 import sqlite3
 from sqlite3 import Error
 import re
 
-tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-model = AutoModelForCausalLM.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+# Initializing OpenAI client
+client = OpenAI(
+    base_url='http://localhost:11434/v1',
+    api_key='ollama',  # required, but unused
+)
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = model.to(device)
-
-class StopOnTokens(StoppingCriteria):
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
-        stop_ids = [2]  
-        for stop_id in stop_ids:
-            if input_ids[0][-1] == stop_id:  
-                return True
-        return False
-
+# Function to generate model predictions using OpenAI client
 def predict(message, history):
-    history_transformer_format = history + [[message, ""]]
-    stop = StopOnTokens()
-
-    # Formatting the input for the model.
-    messages = "</s>".join(["</s>".join(["\n:" + item[0], "\n:" + item[1]]) for item in history_transformer_format])
-    model_inputs = tokenizer([messages], return_tensors="pt").to(device)
-    streamer = TextIteratorStreamer(tokenizer, timeout=10.0, skip_prompt=True, skip_special_tokens=True)
-    generate_kwargs = dict(
-        input_ids=model_inputs['input_ids'],
-        attention_mask=model_inputs['attention_mask'],
-        streamer=streamer,
-        max_new_tokens=1024,
-        do_sample=True,
-        top_p=0.95,
-        top_k=50,
-        temperature=0.7,
-        num_beams=1,
-        stopping_criteria=StoppingCriteriaList([stop])
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."}
+    ] + [{"role": "user", "content": h[0]}, {"role": "assistant", "content": h[1]} for h in history] + [{"role": "user", "content": message}]
+    
+    response = client.chat.completions.create(
+        model="llama2",
+        messages=messages
     )
-    t = Thread(target=model.generate, kwargs=generate_kwargs)
-    t.start()  
-    partial_message = ""
-    for new_token in streamer:
-        partial_message += new_token
-        if '</s>' in partial_message:  # Breaking the loop if the stop token is generated.
-            break
-        yield partial_message
+    return response.choices[0].message.content
 
 # Function to create a SQLite connection.
 def create_connection():
@@ -60,6 +32,7 @@ def create_connection():
         print(e)
     return conn
 
+# Function to create a table in the SQLite database.
 def create_table(conn):
     try:
         sql = '''CREATE TABLE activities(
@@ -78,6 +51,7 @@ def create_table(conn):
     except Error as e:
         print(e)
 
+# Function to insert activities into the SQLite database.
 def insert_activities(conn, activities):
     sql = '''INSERT INTO activities(day, steps_walked, hours_slept, water_intake, exercise_duration, mood, calories_intake, productivity_score, work_done)
              VALUES(?,?,?,?,?,?,?,?,?)'''
@@ -93,6 +67,7 @@ def select_activities(conn, day):
     rows = cur.fetchall()
     return rows
 
+# Function to parse user input for logging activities.
 def parse_activity_input(message):
     activity_data = {}
     patterns = {
@@ -113,24 +88,24 @@ def parse_activity_input(message):
 
     return activity_data
 
+# Streamlit interface
 def main():
-    st.title("TinyLlama ChatBot")
-    st.write("Ask TinyLlama any questions or input your daily activities.")
+    st.title("OpenAI ChatBot Activity Tracker")
+    st.write("Ask the assistant any questions or input your daily activities.")
     message = st.text_input('Enter your message')
-    history = []
+    history = []  # You can update this as per your requirement
     if st.button('Send'):
         response = predict(message, history)
-        response_text = "".join([r for r in response])
-        st.write(response_text)
-        activity_data = parse_activity_input(response_text)
+        st.write(response)
+        activity_data = parse_activity_input(response)
         if activity_data:
             day = st.number_input('Enter the day', min_value=1)
             conn = create_connection()
             create_table(conn)
-            activities = (day, activity_data.get('steps_walked', 0), activity_data.get('hours_slept', 0), 
-                          activity_data.get('water_intake', 0), activity_data.get('exercise_duration', 0), 
-                          activity_data.get('mood', ''), activity_data.get('calories_intake', 0), 
-                          activity_data.get('productivity_score', 0), activity_data.get('work_done', ''))
+            activities = (day, int(activity_data.get('steps_walked', 0)), float(activity_data.get('hours_slept', 0)),
+                          float(activity_data.get('water_intake', 0)), int(activity_data.get('exercise_duration', 0)),
+                          activity_data.get('mood', ''), int(activity_data.get('calories_intake', 0)),
+                          int(activity_data.get('productivity_score', 0)), activity_data.get('work_done', ''))
             insert_activities(conn, activities)
             st.write("Activity data logged successfully.")
     conn = create_connection()
